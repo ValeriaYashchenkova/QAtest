@@ -1,72 +1,79 @@
-import pytest
-import allure
-import psycopg2
-from psycopg2.extras import RealDictCursor
+pipeline {
+    agent {
+        kubernetes {
+            inheritFrom 'python'
+            defaultContainer 'python-builder'
+        }
+    }
 
-# Настройки подключения (лучше вынести в pytest fixtures или .env)
-DB_CONFIG = {
-    "host": "10.146.65.166",
-    "port": 5432,
-    "dbname": "ycloud_db3_test",
-    "user": "твой_юзер",      # ← замени
-    "password": "твой_пароль" # ← замени
+    environment {
+        PATH = "/var/lib/jenkins/.local/bin:$PATH"
+        TESTOPS_ENDPOINT = 'https://testops.moscow.alfaintra.net'
+        TESTOPS_PROJECT_ID = '643'
+        TESTOPS_SERVER_ID = 'testOps'
+    }
+
+    stages {
+        stage('Checkout SCM') {
+            steps {
+                git branch: 'master',
+                    url: 'https://git.moscow.alfaintra.net/scm/bialm_ft/bialm_ft_auto.git',
+                    credentialsId: 'login_password_for_repo_bitbucket'
+            }
+        }
+
+        stage('Create venv & Install dependencies') {
+            steps {
+                sh '''
+                    python3.7 -m venv venv
+                    . venv/bin/activate
+                    pip3.7 install --upgrade pip
+                    pip3.7 install -r requirements.txt -i https://binary.alfabank.ru/artifactory/api/pypi/pipy-virtual/simple
+                '''
+            }
+        }
+
+        stage('Run tests') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    pytest tests --alluredir=allure-results
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                echo "🧹 Очистка старых Allure-отчётов..."
+                sh '''
+                    rm -rf allure-report allure-report.zip || true
+                '''
+
+                echo "📊 Публикация Allure отчёта в Jenkins..."  allure([
+                    includeProperties: false,
+                    jdk: '',
+                    properties: [],
+                    reportBuildPolicy: 'ALWAYS',
+                    results: [[path: 'allure-results']]
+                ])
+
+                echo "🚀 Попытка выгрузки в Allure TestOps..."
+                try {
+                    allureTestOpsUpload(
+                        allureResultsPath: 'allure-results',
+                        endpoint: "${TESTOPS_ENDPOINT}",
+                        projectId: "${TESTOPS_PROJECT_ID}",
+                        serverId: "${TESTOPS_SERVER_ID}"
+                    )
+                } catch (err) {
+                    echo "⚠️ Ошибка при выгрузке в Allure TestOps: ${err}"
+                }
+            }
+
+            echo "📦 Архивация артефактов..."
+            archiveArtifacts artifacts: 'allure-results/**', allowEmptyArchive: true
+        }
+    }
 }
-
-QUERY = """
-SELECT TRANSNO_NCODE, VALUE_DAY, COUNT(*) AS cnt
-FROM DMRB.CARDTRANSACTION_STRAN
-GROUP BY TRANSNO_NCODE, VALUE_DAY
-HAVING COUNT(*) > 1
-ORDER BY cnt DESC;
-"""
-
-
-@allure.epic("Проверка качества данных")
-@allure.feature("Дубли по бизнес-ключу")
-@allure.story("Отсутствие дублей в CARDTRANSACTION_STRAN")
-@allure.severity(allure.severity_level.CRITICAL)
-def test_no_duplicates_in_cardtransaction():
-    with allure.step("Подключение к базе PostgreSQL"):
-        conn = psycopg2.connect(**DB_CONFIG, cursor_factory=RealDictCursor)
-        cur = conn.cursor()
-
-    with allure.step("Выполнение запроса на поиск дублей"):
-        cur.execute(QUERY)
-        duplicates = cur.fetchall()
-
-    with allure.step("Анализ результата"):
-        if duplicates:
-            # Формируем красивую таблицу с дублями
-            table_rows = []
-            for row in duplicates:
-                table_rows.append(f"<tr><td>{row['transno_ncode']}</td><td>{row['value_day']}</td><td>{row['cnt']}</td></tr>")
-
-            html_table = f"""
-            <html><body>
-                <h3>Обнаружены дубли по ключу (TRANSNO_NCODE + VALUE_DAY):</h3>
-                <table border="1" style="border-collapse: collapse;">
-                    <tr><th>TRANSNO_NCODE</th><th>VALUE_DAY</th><th>Количество дублей</th></tr>
-                    {''.join(table_rows)}
-                </table>
-            </body></html>
-            """
-
-            allure.attach(
-                html_table,
-                name="Найденные дубли.html",
-                attachment_type=allure.attachment_type.HTML
-            )
-
-            # Текстовая версия тоже полезна
-            text_result = "\n".join([f"{r['transno_ncode']}\t{r['value_day']}\t{r['cnt']}" for r in duplicates])
-            allure.attach(
-                text_result,
-                name="duplicates.txt",
-                attachment_type=allure.attachment_type.TEXT
-            )
-
-            pytest.fail(f"Найдено {len(duplicates)} дублей по ключу (TRANSNO_NCODE, VALUE_DAY)!")
-        else:
-            allure.attach("Дублей не найдено — всё чисто!", name="Результат проверки", attachment_type=allure.attachment_type.TEXT)
-
-    conn.close()
